@@ -1,0 +1,264 @@
+## Create Stateful MIG Reference: https://agarwalsh.medium.com/gcp-sql-server-using-stateful-migs-for-ha-and-dr-f053142cbc4
+
+gcloud compute disks create pd-oradata --project=c4c-oracle --type=pd-ssd --size=100GB --region=europe-west3 --replica-zones=projects/c4c-oracle/zones/europe-west3-a,projects/c4c-oracle/zones/europe-west3-c
+
+gcloud compute instances create orabase --project=c4c-oracle --zone=europe-west3-a --machine-type=e2-standard-4 --network-interface=network-tier=PREMIUM,subnet=default --maintenance-policy=MIGRATE --provisioning-model=STANDARD --service-account=40790767626-compute@developer.gserviceaccount.com --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append --create-disk=boot=yes,device-name=orabase,image=projects/rhel-cloud/global/images/rhel-8-v20220822,mode=rw,size=40,type=projects/c4c-oracle/zones/europe-west3-a/diskTypes/pd-ssd --disk=boot=no,device-name=pd-oradata,mode=rw,name=pd-oradata,scope=regional --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring --reservation-affinity=any
+
+
+##### Reference #####
+##### https://oracle-base.com/articles/19c/oracle-db-19c-installation-on-oracle-linux-8
+#####################
+
+sudo su -
+curl -o oracle-database-preinstall-19c-1.0-2.el8.x86_64.rpm https://yum.oracle.com/repo/OracleLinux/OL8/appstream/x86_64/getPackage/oracle-database-preinstall-19c-1.0-2.el8.x86_64.rpm
+yum -y localinstall oracle-database-preinstall-19c-1.0-2.el8.x86_64.rpm
+
+yum -y install xclock
+
+# https://cloud.google.com/compute/docs/disks/add-persistent-disk
+# get disk attached to vm
+lsblk
+sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/sdb
+mkdir -p /mnt/oradata/orabase/dbhome
+mkdir -p /mnt/oradata/datafiles
+mkdir -p /mnt/oradata/fra
+chmod -R a+w /mnt/oradata
+
+# get uuid of disk
+blkid /dev/sdb
+
+# add the disk to fstab
+# e.g., UUID=d722aa9c-4757-49c2-a80f-0dd824fb0329 /mnt/oradata ext4 discard,defaults,nofail 0 2
+UUID=${uuid} /mnt/oradata ext4 discard,defaults 0 2
+
+# create swap space (10GB)
+dd if=/dev/zero of=/newswap bs=1048576 count=10240
+chmod 0600 /newswap
+mkswap /newswap
+swapon /newswap
+
+# add swap to fstab
+/newswap    swap    swap   defaults 0 0
+
+
+
+
+##### start a fresh ssh session with X forwarding
+gcloud compute ssh --ssh-flag="-X" orabase
+# make sure that display works
+xclock
+# get magic cookie for the current session
+xauth list
+
+sudo su - oracle
+touch /home/oracle/.Xauthority
+xauth add ${magic_cookie}
+export DISPLAY=localhost:10
+xclock
+cd /mnt/oradata/orabase/dbhome
+curl -o "LINUX.X64_193000_db_home.zip" "${link_to_oracle_binary}"
+unzip LINUX.X64_193000_db_home.zip
+export CV_ASSUME_DISTID=OEL7.6
+./runInstaller
+
+
+# as root 
+# execute all root scripts as suggested by installer
+/mnt/oradata/orabase/dbhome/root.sh
+
+
+# as oracle
+cat >> ~/.bash_profile <<EOF
+export ORACLE_HOME=/mnt/oradata/orabase/dbhome
+export PATH=$PATH:$ORACLE_HOME/bin
+export ORACLE_SID=orcl19c
+export ORAENV_ASK=NO
+. oraenv
+export ORAENV_ASK=YES
+EOF
+. ~/.bash_profile
+
+# create database
+dbca
+
+# after database creation, open pdb and remember its state
+ALTER PLUGGABLE DATABASE pdb1 OPEN;
+ALTER PLUGGABLE DATABASE pdb1 SAVE STATE;
+
+
+## setup auto start stop Oracle database and listener
+## https://docs.oracle.com/en/database/oracle/oracle-database/19/unxar/stopping-and-starting-oracle-software.html#GUID-CA969105-B62B-4F5B-B35C-8FB64EC93FAA
+## https://oracle-base.com/articles/linux/linux-services-systemd#creating-linux-services
+
+# copy oradata/scripts/* into the vm /mnt/oradata/scripts/*
+chown -R oracle:oinstall /mnt/oradata/scripts
+chmod u+x /mnt/oradata/scripts/*.sh
+
+# as root
+# copy system_files/dbora.service into the vm /etc/systemd/system/dbora.service
+systemctl daemon-reload
+systemctl enable dbora.service
+
+# systemctl start dbora.service
+# systemctl stop dbora.service
+
+# create disk image
+gcloud compute images create orabase-diskimage --project=c4c-oracle --source-disk=orabase --source-disk-zone=europe-west3-a --storage-location=europe-west3
+
+# create instance template
+gcloud compute instance-templates create orabase-instance-template --project=c4c-oracle --machine-type=e2-standard-4 --network-interface=network=default,network-tier=PREMIUM --maintenance-policy=MIGRATE --provisioning-model=STANDARD --service-account=40790767626-compute@developer.gserviceaccount.com --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append --create-disk=auto-delete=yes,boot=yes,device-name=orabase-instance-template,image=projects/c4c-oracle/global/images/orabase-diskimage,mode=rw,size=40,type=pd-balanced --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring --reservation-affinity=any
+
+# create health check
+gcloud compute health-checks create tcp oralistener-check \
+--port=1521 \
+--proxy-header=NONE \
+--check-interval=2 \
+--timeout=2 \
+--unhealthy-threshold=2 \
+--healthy-threshold=2
+
+
+gcloud compute firewall-rules create fw-allow-health-checks \
+    --action=ALLOW \
+    --direction=INGRESS \
+    --source-ranges=35.191.0.0/16,130.211.0.0/22 \
+    --rules=tcp
+
+
+# create stateful MIG
+export projectid=$(gcloud config get-value project)
+gcloud beta compute instance-groups managed create ora-smig \
+--project=${projectid} \
+--base-instance-name=ora-smig \
+--size=0 \
+--template=orabase-instance-template \
+--zones=europe-west3-c,europe-west3-a \
+--instance-redistribution-type=NONE \
+--stateful-external-ip=interface-name=nic0,auto-delete=never \
+--stateful-internal-ip=interface-name=nic0,auto-delete=never \
+--health-check=oralistener-check \
+--initial-delay=300
+
+gcloud compute instance-groups managed create-instance ora-smig \
+--instance=ora-mig-inst-1 \
+--stateful-disk device-name=pd-oradata,auto-delete=never,source=projects/$projectid/regions/europe-west3/disks/pd-oradata,mode=rw \
+--zone=europe-west3-a
+#--region=europe-west3
+
+
+
+gcloud compute ssh --ssh-flag="-X" ora-mig-inst-1
+
+gcloud compute instance-groups managed delete-instances ora-smig \
+--instances=ora-mig-inst-1 \
+--region=europe-west3
+
+
+### change $ORACLE_HOME/network/admin/listener.ora
+
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = orabase.europe-west3-a.c.c4c-oracle.internal)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+# to #
+
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = ora-mig-inst-1)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+
+## similarly for tnsnames.ora
+
+
+
+
+### update vm in stateful MIG with new templates
+
+gcloud beta compute instance-groups managed rolling-action start-update ora-smig \
+--project=c4c-oracle \
+--type='proactive' \
+--max-surge=0 \
+--max-unavailable=2 \
+--min-ready=0 \
+--minimal-action='refresh' \
+--most-disruptive-allowed-action='replace' \
+--replacement-method='recreate' \
+--region=europe-west3 \
+--version=template=orabase-instance-template-v3
+
+
+
+
+
+
+
+gcloud compute instance-groups managed create ora-mig-repd --project=c4c-oracle --base-instance-name=ora-mig-repd --size=1 --template=orabase-instance-template-v3 --zones=europe-west3-c,europe-west3-a --target-distribution-shape=EVEN --instance-redistribution-type=NONE --list-managed-instances-results=PAGELESS --health-check=oralistener-check --initial-delay=300
+
+
+gcloud compute project-info add-metadata \
+    --metadata=ACTIVE_DB_ZONE=europe-west3-a
+
+
+
+ACTIVE_DB_ZONE=$(curl "http://metadata.google.internal/computeMetadata/v1/project/attributes/ACTIVE_DB_ZONE" -H "Metadata-Flavor: Google")
+
+
+#! /bin/bash
+INSTANCE_FQDN=$(curl http://metadata.google.internal/computeMetadata/v1/instance/hostname -H Metadata-Flavor:Google)
+INSTANCE_NAME=$(echo $INSTANCE_FQDN | cut -d . -f1)
+INSTANCE_ZONE=$(echo $INSTANCE_FQDN | cut -d . -f2)
+REPD_NAME=pd-oradata
+
+gcloud compute instances attach-disk ${INSTANCE_NAME}  \
+    --disk ${REPD_NAME} --disk-scope regional \
+    --zone ${INSTANCE_ZONE} \
+    --force-attach
+
+mount -a
+
+export ORACLE_HOME=/mnt/oradata/orabase/dbhome
+export PATH=$PATH:$ORACLE_HOME/bin
+export ORACLE_SID=orcl19c
+export ORAENV_ASK=NO
+. oraenv
+export ORAENV_ASK=YES
+
+### update tnsnames
+echo "ORCL19C =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${INSTANCE_FQDN})(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = orcl19c)
+    )
+  )
+
+LISTENER_ORCL19C =
+  (ADDRESS = (PROTOCOL = TCP)(HOST = ${INSTANCE_FQDN})(PORT = 1521))" > $ORACLE_HOME/network/admin/tnsnames.ora
+
+
+### update listener.ora
+echo "LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = ${INSTANCE_FQDN})(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )" > $ORACLE_HOME/network/admin/listener.ora
+
+
+### startup listener and db
+su -c 'lsnrctl start LISTENER' oracle
+su -c 'sqlplus / as sysdba <<EOF
+startup
+EOF' oracle
+
+
